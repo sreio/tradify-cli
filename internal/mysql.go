@@ -13,16 +13,19 @@ import (
 )
 
 type MySQLConfig struct {
-	DSN        string
-	Table      string
-	PK         []string // 支持复合主键；为空表示无主键
-	IdentifyBy []string // 无主键时用于 WHERE 定位的列
-	Columns    []string
-	To         string
-	BatchSize  int
-	Workers    int
-	RPS        int
-	DryRun     bool
+	DSN             string
+	Table           string
+	PK              []string // 支持复合主键；为空表示无主键
+	IdentifyBy      []string // 无主键时用于 WHERE 定位的列
+	Columns         []string
+	To              string
+	BatchSize       int
+	Workers         int
+	RPS             int
+	DryRun          bool
+	MaxOpenConns    int
+	MaxIdleConns    int
+	ConnMaxLifetime time.Duration
 }
 
 func RunMySQL(cfg MySQLConfig) error {
@@ -35,9 +38,15 @@ func RunMySQL(cfg MySQLConfig) error {
 	}
 	defer db.Close()
 
-	db.SetMaxOpenConns(200)
-	db.SetMaxIdleConns(20)
-	db.SetConnMaxLifetime(30 * time.Minute)
+	if cfg.MaxOpenConns > 0 {
+		db.SetMaxOpenConns(cfg.MaxOpenConns)
+	}
+	if cfg.MaxIdleConns > 0 {
+		db.SetMaxIdleConns(cfg.MaxIdleConns)
+	}
+	if cfg.ConnMaxLifetime > 0 {
+		db.SetConnMaxLifetime(cfg.ConnMaxLifetime)
+	}
 
 	if err := db.Ping(); err != nil {
 		return fmt.Errorf("db ping: %w", err)

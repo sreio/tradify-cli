@@ -4,6 +4,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"time"
 
 	"github.com/sreio/tradify-cli/internal"
 )
@@ -57,11 +58,14 @@ func runMySQL(args []string) {
 		dsn        = fs.String("dsn", "", "【必填】MySQL 连接串，例如：user:pass@tcp(127.0.0.1:3306)/db?charset=utf8mb4&parseTime=true")
 		table      = fs.String("table", "", "【必填】表名")
 		columnsStr = fs.String("columns", "", "【必填】要转换的列名，逗号分隔，如：name,content")
-		to         = fs.String("to", "s2twp", "OpenCC 转换配置（缺省 s2twp），可选如：s2t、t2s 等")
-		batchSize  = fs.Int("batch-size", 500, "每批处理行数（缺省 500）")
-		workers    = fs.Int("workers", 8, "并发 worker 数（缺省 8）")
-		rps        = fs.Int("rps", 0, "每秒最大处理行数（缺省 0 不限速）")
+		to         = fs.String("to", "s2twp", "OpenCC 转换配置（默认 s2twp），可选如：s2t、t2s 等")
+		batchSize  = fs.Int("batch-size", 500, "每批处理行数（默认 500）")
+		workers    = fs.Int("workers", 8, "并发 worker 数（默认 8）")
+		rps        = fs.Int("rps", 0, "每秒最大处理行数（默认 0 不限速）")
 		dryRun     = fs.Bool("dry-run", true, "试运行：不落库，仅打印将运行的更新")
+		maxOpen    = fs.Int("max-open", 200, "数据库最大打开连接数（默认200）")
+		maxIdle    = fs.Int("max-idle", 20, "数据库最大空闲连接数（默认20）")
+		connLife   = fs.Duration("conn-max-lifetime", 30*time.Minute, "单连接最大生命周期（默认30m）")
 	)
 
 	var pks multiCSV
@@ -73,7 +77,7 @@ func runMySQL(args []string) {
 		fmt.Fprintf(os.Stderr, `用法：tradify-cli mysql [参数...]
 
 说明：
-  批量将 MySQL 表中指定列的文本从简体转换为繁体（缺省 s2twp）。
+  批量将 MySQL 表中指定列的文本从简体转换为繁体（默认 s2twp）。
   支持 dry-run 试运行、并发处理、RPS 限速、复合主键增量遍历。
 
 参数：
@@ -104,16 +108,19 @@ func runMySQL(args []string) {
 	}
 
 	cfg := internal.MySQLConfig{
-		DSN:        *dsn,
-		Table:      *table,
-		PK:         pks.Values(),
-		IdentifyBy: idBy.Values(),
-		Columns:    internal.SplitCSV(*columnsStr),
-		To:         *to,
-		BatchSize:  *batchSize,
-		Workers:    *workers,
-		RPS:        *rps,
-		DryRun:     *dryRun,
+		DSN:             *dsn,
+		Table:           *table,
+		PK:              pks.Values(),
+		IdentifyBy:      idBy.Values(),
+		Columns:         internal.SplitCSV(*columnsStr),
+		To:              *to,
+		BatchSize:       *batchSize,
+		Workers:         *workers,
+		RPS:             *rps,
+		DryRun:          *dryRun,
+		MaxOpenConns:    *maxOpen,
+		MaxIdleConns:    *maxIdle,
+		ConnMaxLifetime: *connLife,
 	}
 
 	if err := internal.RunMySQL(cfg); err != nil {
@@ -129,10 +136,10 @@ func runFile(args []string) {
 	fs.SetOutput(os.Stderr)
 
 	var (
-		dir     = fs.String("dir", ".", "【必填】要处理的根目录路径（缺省当前目录）")
+		dir     = fs.String("dir", ".", "【必填】要处理的根目录路径（默认当前目录）")
 		extsCSV = fs.String("ext", "", "过滤的文档扩展名（可逗号分隔，如：.txt,.md；留空表示处理所有文档）")
-		to      = fs.String("to", "s2twp", "OpenCC 转换配置（缺省 s2twp）")
-		backup  = fs.Bool("backup", false, "是否对每个被修改的文档生成 .bak 备份（缺省 false）")
+		to      = fs.String("to", "s2twp", "OpenCC 转换配置（默认 s2twp）")
+		backup  = fs.Bool("backup", false, "是否对每个被修改的文档生成 .bak 备份（默认 false）")
 		dryRun  = fs.Bool("dry-run", true, "试运行：不写回，仅列出将被修改的文档")
 		workers = fs.Int("workers", 4, "并发 worker 数（缺省 4）")
 	)
@@ -141,7 +148,7 @@ func runFile(args []string) {
 		fmt.Fprintf(os.Stderr, `用法：tradify-cli file [参数...]
 
 说明：
-  递归遍历目录，将匹配扩展名的文档内容从简体转换为繁体（缺省 s2twp）。
+  递归遍历目录，将匹配扩展名的文档内容从简体转换为繁体（默认 s2twp）。
   支持 dry-run 试运行与备份。
 
 参数：

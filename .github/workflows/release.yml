@@ -34,6 +34,6 @@ jobs:
 
       - name: Upload new asset to existing release
         run: |
-          gh release upload ${{ github.ref_name }} dist/tradify-cli-${{ matrix.goos }}_${{ matrix.goarch }}* --clobber
+          gh release upload ${{ github.ref_name }} dist/tradify-cli-${{ matrix.goos }}-${{ matrix.goarch }}* --clobber
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -1,6 +1,6 @@
 # tradify-cli
 
-一个统一的 Go 命令行工具，用于将**简体中文**批量转换为**繁体中文**（缺省台湾正体 `s2twp`）。
+一个统一的 Go 命令行工具，用于将**简体中文**批量转换为**繁体中文**（默认台湾正体 `s2twp`）。
 - `mysql` 子命令：批量转换 MySQL 表指定列
 - `file` 子命令：批量转换目录内文本文件
 
@@ -40,10 +40,10 @@ tradify-cli mysql \
 
 - `--dsn`：MySQL 连接串（必填）
 - `--table`：表名（必填）
-- `--pk`：主键列（可多次，支持复合主键），缺省表示**无主键表**
+- `--pk`：主键列（可多次，支持复合主键），默认表示**无主键表**
 - `--identify-by`：无主键表用于精确定位的列
 - `--columns`：要转换的列，逗号分隔（必填）
-- 其它：`--to`（缺省 `s2twp`）、`--batch-size`、`--workers`、`--rps`、`--dry-run`
+- 其它：`--to`（默认 `s2twp`）、`--batch-size`、`--workers`、`--rps`、`--dry-run`
 
 ### file 子命令
 
@@ -52,12 +52,12 @@ tradify-cli file --dir . --ext ".txt,.md" --dry-run
 tradify-cli file --dir /var/www --ext ".php" --backup
 ```
 
-- `--dir`：根目录（缺省当前目录）
+- `--dir`：根目录（默认当前目录）
 - `--ext`：过滤扩展名（逗号分隔；留空表示全部）
-- `--to`：OpenCC 配置（缺省 `s2twp`）
+- `--to`：OpenCC 配置（默认 `s2twp`）
 - `--backup`：写回前保存 `.bak` 备份
 - `--dry-run`：试运行，不修改任何文件
-- `--workers`：并发数量（缺省 4）
+- `--workers`：并发数量（默认 4）
 
 ## 注意事项
 - 转换使用 [OpenCC](https://github.com/BYVoid/OpenCC) 的 Go 实现 `github.com/longbridgeapp/opencc`。

@@ -20,26 +20,20 @@ jobs:
         with:
           go-version: '1.25.x'
 
-      - name: Build
+      - name: Build executable
         run: |
-          mkdir -p dist
-          GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} CGO_ENABLED=0 \
-            go build -trimpath -ldflags="-s -w" -o dist/tradify-cli-${{ matrix.goos }}-${{ matrix.goarch }} ./cmd
+          EXT=""
+          if [ "${{ matrix.goos }}" = "windows" ]; then
+            EXT=".exe"
+          fi
 
-      - name: Zip artifacts
+          GOOS=${{ matrix.goos }} \
+          GOARCH=${{ matrix.goarch }} \
+          CGO_ENABLED=0 \
+          go build -trimpath -ldflags="-s -w" -o dist/tradify-cli-${{ matrix.goos }}-${{ matrix.goarch }}${EXT} ./cmd 
+
+      - name: Upload new asset to existing release
         run: |
-          cd dist
-          for f in *; do
-            if [[ "$f" == *windows* ]]; then
-              zip "$f.zip" "$f"
-            else
-              tar -czf "$f.tar.gz" "$f"
-            fi
-          done
-
-      - name: Upload Release Assets
-        uses: softprops/action-gh-release@v2
-        with:
-          files: dist/*.{tar.gz,zip}
+          gh release upload ${{ github.ref_name }} dist/tradify-cli-${{ matrix.goos }}_${{ matrix.goarch }}* --clobber
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

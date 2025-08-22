@@ -6,10 +6,13 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"os"
 	"strings"
 	"time"
 
 	_ "github.com/go-sql-driver/mysql"
+	"github.com/vbauerster/mpb/v8"
+	"github.com/vbauerster/mpb/v8/decor"
 )
 
 type MySQLConfig struct {
@@ -20,7 +23,7 @@ type MySQLConfig struct {
 	Columns         []string
 	To              string
 	BatchSize       int
-	Workers         int
+	Workers         int // 预留：后续可做每表内部并发
 	RPS             int
 	DryRun          bool
 	MaxOpenConns    int
@@ -28,10 +31,23 @@ type MySQLConfig struct {
 	ConnMaxLifetime time.Duration
 }
 
+// 单表模式：内部创建一个进度容器
 func RunMySQL(cfg MySQLConfig) error {
+	p := mpb.New(
+		mpb.WithWidth(60),
+		mpb.WithOutput(os.Stdout), // 进度条只往 STDOUT
+		mpb.WithRefreshRate(120*time.Millisecond),
+	)
+	defer p.Wait()
+	return RunMySQLWithProgress(cfg, p)
+}
+
+// 多表模式：外部传入进度容器（便于多条进度条并发显示）
+func RunMySQLWithProgress(cfg MySQLConfig, p *mpb.Progress) error {
 	if len(cfg.Columns) == 0 {
 		return errors.New("必须提供 --columns")
 	}
+
 	db, err := sql.Open("mysql", cfg.DSN)
 	if err != nil {
 		return fmt.Errorf("open db: %w", err)
@@ -52,6 +68,45 @@ func RunMySQL(cfg MySQLConfig) error {
 		return fmt.Errorf("db ping: %w", err)
 	}
 
+	// 统计总行数（用于进度条总量）
+	total, err := countTotalRows(db, cfg.Table)
+	if err != nil {
+		// 统计失败则使用“动态总量”模式
+		total = -1
+	}
+
+	// 进度条（每表一条）
+	var bar *mpb.Bar
+	if p != nil {
+		if total > 0 {
+			// 总量已知
+			bar = p.AddBar(
+				total,
+				mpb.PrependDecorators(
+					decor.Name("["+cfg.Table+"] "),
+					decor.CountersNoUnit("%d/%d"),
+					decor.Percentage(decor.WCSyncWidth),
+				),
+				mpb.AppendDecorators(
+					decor.EwmaETA(decor.ET_STYLE_GO, 60, decor.WCSyncWidth), // 估算剩余时间
+				),
+			)
+		} else {
+			// 总量未知：从 0 开始，按批动态增加总量
+			bar = p.AddBar(
+				0,
+				mpb.PrependDecorators(
+					decor.Name("["+cfg.Table+"] "),
+					decor.CountersNoUnit("%d/%d"),
+					decor.Percentage(decor.WCSyncWidth),
+				),
+				mpb.AppendDecorators(
+					decor.EwmaETA(decor.ET_STYLE_GO, 60, decor.WCSyncWidth),
+				),
+			)
+		}
+	}
+
 	// RPS 节流器
 	var rate <-chan time.Time
 	if cfg.RPS > 0 {
@@ -65,14 +120,23 @@ func RunMySQL(cfg MySQLConfig) error {
 	}
 
 	if len(cfg.PK) > 0 {
-		return processWithPK(db, cfg, rate)
+		return processWithPK(db, cfg, rate, bar, total)
 	}
-	return processNoPK(db, cfg, rate)
+	return processNoPK(db, cfg, rate, bar, total)
+}
+
+// 统计表总行数
+func countTotalRows(db *sql.DB, table string) (int64, error) {
+	var total int64
+	row := db.QueryRow("SELECT COUNT(*) FROM `" + table + "`")
+	if err := row.Scan(&total); err != nil {
+		return 0, err
+	}
+	return total, nil
 }
 
 // ---------- 复合主键/单主键 增量遍历 ----------
-
-func processWithPK(db *sql.DB, cfg MySQLConfig, rate <-chan time.Time) error {
+func processWithPK(db *sql.DB, cfg MySQLConfig, rate <-chan time.Time, bar *mpb.Bar, total int64) error {
 	log.Printf("[mysql] 开始处理（有主键） table=%s pk=%v cols=%v", cfg.Table, cfg.PK, cfg.Columns)
 
 	lastKey := make([]sql.NullString, len(cfg.PK)) // 初始为空
@@ -102,7 +166,7 @@ func processWithPK(db *sql.DB, cfg MySQLConfig, rate <-chan time.Time) error {
 			continue
 		}
 
-		count := 0
+		n := 0
 		type row struct {
 			pk   []sql.NullString
 			data map[string]*string
@@ -133,13 +197,22 @@ func processWithPK(db *sql.DB, cfg MySQLConfig, rate <-chan time.Time) error {
 				}
 			}
 			batch = append(batch, r)
-			count++
+			n++
 		}
 		rows.Close()
 
-		if count == 0 {
+		if n == 0 {
+			if bar != nil {
+				// 补齐并标记完成
+				bar.SetTotal(bar.Current(), true)
+			}
 			log.Println("[mysql] 处理完成（无更多数据）")
 			return nil
+		}
+
+		// 未知总量：按批动态扩充总量
+		if bar != nil && total <= 0 {
+			bar.SetTotal(bar.Current()+int64(n), false)
 		}
 
 		// 逐行处理
@@ -147,6 +220,7 @@ func processWithPK(db *sql.DB, cfg MySQLConfig, rate <-chan time.Time) error {
 			if rate != nil {
 				<-rate
 			}
+
 			changed := map[string]string{}
 			for _, c := range cfg.Columns {
 				ptr := r.data[c]
@@ -162,38 +236,39 @@ func processWithPK(db *sql.DB, cfg MySQLConfig, rate <-chan time.Time) error {
 					changed[c] = out
 				}
 			}
-			if len(changed) == 0 {
-				continue
-			}
-			// UPDATE SET … WHERE pk1=? AND pk2=? …
-			setParts := []string{}
-			args := []interface{}{}
-			for _, c := range cfg.Columns {
-				if v, ok := changed[c]; ok {
-					setParts = append(setParts, fmt.Sprintf("`%s` = ?", c))
-					args = append(args, v)
-				}
-			}
-			where := []string{}
-			for i, pk := range cfg.PK {
-				if r.pk[i].Valid {
-					where = append(where, fmt.Sprintf("`%s` = ?", pk))
-					args = append(args, r.pk[i].String)
-				} else {
-					where = append(where, fmt.Sprintf("`%s` IS NULL", pk))
-				}
-			}
-			sqlText := fmt.Sprintf("UPDATE `%s` SET %s WHERE %s", cfg.Table, strings.Join(setParts, ","), strings.Join(where, " AND "))
 
-			if cfg.DryRun {
-				log.Printf("[DRYRUN] %s -- args=%v", sqlText, args)
-			} else {
+			if len(changed) > 0 && !cfg.DryRun {
+				// UPDATE SET … WHERE pk1=? AND pk2=? …
+				setParts := []string{}
+				args := []interface{}{}
+				for _, c := range cfg.Columns {
+					if v, ok := changed[c]; ok {
+						setParts = append(setParts, fmt.Sprintf("`%s` = ?", c))
+						args = append(args, v)
+					}
+				}
+				where := []string{}
+				for i, pk := range cfg.PK {
+					if r.pk[i].Valid {
+						where = append(where, fmt.Sprintf("`%s` = ?", pk))
+						args = append(args, r.pk[i].String)
+					} else {
+						where = append(where, fmt.Sprintf("`%s` IS NULL", pk))
+					}
+				}
+				sqlText := fmt.Sprintf("UPDATE `%s` SET %s WHERE %s", cfg.Table, strings.Join(setParts, ","), strings.Join(where, " AND "))
+
 				ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 				_, err := db.ExecContext(ctx, sqlText, args...)
 				cancel()
 				if err != nil {
 					log.Printf("[mysql] update err: %v -- sql=%s -- args=%v", err, sqlText, args)
 				}
+			}
+
+			// 推进进度（行）
+			if bar != nil {
+				bar.EwmaIncrement(1)
 			}
 		}
 
@@ -206,8 +281,7 @@ func processWithPK(db *sql.DB, cfg MySQLConfig, rate <-chan time.Time) error {
 }
 
 // ---------- 无主键表：使用 identify-by 或整行匹配 ----------
-
-func processNoPK(db *sql.DB, cfg MySQLConfig, rate <-chan time.Time) error {
+func processNoPK(db *sql.DB, cfg MySQLConfig, rate <-chan time.Time, bar *mpb.Bar, total int64) error {
 	log.Printf("[mysql] 开始处理（无主键） table=%s cols=%v identifyBy=%v", cfg.Table, cfg.Columns, cfg.IdentifyBy)
 
 	// 读取所有列名
@@ -228,11 +302,15 @@ func processNoPK(db *sql.DB, cfg MySQLConfig, rate <-chan time.Time) error {
 			time.Sleep(5 * time.Second)
 			continue
 		}
-		count := 0
+		n := 0
+
+		// 批内处理
+		type rowValsT = []*string
+		var rowVals rowValsT
 
 		for rows.Next() {
 			dst := make([]interface{}, len(allCols))
-			rowVals := make([]*string, len(allCols))
+			rowVals = make([]*string, len(allCols))
 			for i := 0; i < len(allCols); i++ {
 				var ns sql.NullString
 				dst[i] = &ns
@@ -270,55 +348,50 @@ func processNoPK(db *sql.DB, cfg MySQLConfig, rate <-chan time.Time) error {
 					changed[c] = out
 				}
 			}
-			if len(changed) == 0 {
-				continue
-			}
 
-			// 构建 WHERE（优先 identify-by）
-			where := []string{}
-			args := []interface{}{}
-			if len(cfg.IdentifyBy) > 0 {
-				for _, col := range cfg.IdentifyBy {
-					idx := indexOf(allCols, col)
-					if idx < 0 {
-						continue
-					}
-					if rowVals[idx] == nil {
-						where = append(where, fmt.Sprintf("`%s` IS NULL", col))
-					} else {
-						where = append(where, fmt.Sprintf("`%s` = ?", col))
-						args = append(args, *rowVals[idx])
+			if len(changed) > 0 && !cfg.DryRun {
+				// 构建 WHERE（优先 identify-by）
+				where := []string{}
+				args := []interface{}{}
+
+				setParts := []string{}
+				for _, c := range cfg.Columns {
+					if v, ok := changed[c]; ok {
+						setParts = append(setParts, fmt.Sprintf("`%s` = ?", c))
+						args = append(args, v)
 					}
 				}
-			} else {
-				// 整行匹配（可能较慢），并加 LIMIT 1
-				for i, col := range allCols {
-					if rowVals[i] == nil {
-						where = append(where, fmt.Sprintf("`%s` IS NULL", col))
-					} else {
-						where = append(where, fmt.Sprintf("`%s` = ?", col))
-						args = append(args, *rowVals[i])
+
+				if len(cfg.IdentifyBy) > 0 {
+					for _, col := range cfg.IdentifyBy {
+						idx := indexOf(allCols, col)
+						if idx < 0 {
+							continue
+						}
+						if rowVals[idx] == nil {
+							where = append(where, fmt.Sprintf("`%s` IS NULL", col))
+						} else {
+							where = append(where, fmt.Sprintf("`%s` = ?", col))
+							args = append(args, *rowVals[idx])
+						}
+					}
+				} else {
+					// 整行匹配（可能较慢），并加 LIMIT 1
+					for i, col := range allCols {
+						if rowVals[i] == nil {
+							where = append(where, fmt.Sprintf("`%s` IS NULL", col))
+						} else {
+							where = append(where, fmt.Sprintf("`%s` = ?", col))
+							args = append(args, *rowVals[i])
+						}
 					}
 				}
-			}
 
-			// SET
-			setParts := []string{}
-			for _, c := range cfg.Columns {
-				if v, ok := changed[c]; ok {
-					setParts = append(setParts, fmt.Sprintf("`%s` = ?", c))
-					args = append(args, v)
+				sqlText := fmt.Sprintf("UPDATE `%s` SET %s WHERE %s", cfg.Table, strings.Join(setParts, ","), strings.Join(where, " AND "))
+				if len(cfg.IdentifyBy) == 0 {
+					sqlText += " LIMIT 1"
 				}
-			}
 
-			sqlText := fmt.Sprintf("UPDATE `%s` SET %s WHERE %s", cfg.Table, strings.Join(setParts, ","), strings.Join(where, " AND "))
-			if len(cfg.IdentifyBy) == 0 {
-				sqlText += " LIMIT 1"
-			}
-
-			if cfg.DryRun {
-				log.Printf("[DRYRUN] %s -- args=%v", sqlText, args)
-			} else {
 				ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 				_, err := db.ExecContext(ctx, sqlText, args...)
 				cancel()
@@ -326,15 +399,30 @@ func processNoPK(db *sql.DB, cfg MySQLConfig, rate <-chan time.Time) error {
 					log.Printf("[mysql] update err: %v -- sql=%s -- args=%v", err, sqlText, args)
 				}
 			}
-			count++
+
+			// 推进进度（行）
+			if bar != nil {
+				bar.EwmaIncrement(1)
+			}
+
+			n++
 		}
 		rows.Close()
 
-		if count == 0 {
+		if n == 0 {
+			if bar != nil {
+				bar.SetTotal(bar.Current(), true)
+			}
 			log.Println("[mysql] 处理完成（无更多数据）")
 			return nil
 		}
-		offset += count
+
+		// 未知总量：按批动态扩充总量
+		if bar != nil && total <= 0 {
+			bar.SetTotal(bar.Current()+int64(n), false)
+		}
+
+		offset += n
 	}
 }
 
